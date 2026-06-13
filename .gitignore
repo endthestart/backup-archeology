@@ -1,0 +1,56 @@
+# Logs
+*.log
+logs/
+
+# Generated reports / cleanup state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*-manifest.csv
+*-cleanup-plan.csv
+.backup-archeology-quarantine/
+
+# Test directories
+/test-*
+/tmp-*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Editor files
+*.swp
+*.swo
+*~
+.*.swp
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local assistant/editor state
+.claude/
+.agents/
+.codex/
+AGENTS.md
+CLAUDE.md
+
+# Local config (users should use ~/.config/backup-archeology/)
+/config.local
