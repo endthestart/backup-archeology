@@ -56,6 +56,10 @@ def canonical(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
 
 
+def absolute(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
 def format_size(size: int) -> str:
     value = float(size or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -683,10 +687,10 @@ class Scanner:
 
         self.root_path = root
         self.internal_db_paths = {
-            self.db.db_path,
-            self.db.db_path + "-wal",
-            self.db.db_path + "-shm",
-            self.db.db_path + "-journal",
+            absolute(self.db.db_path),
+            absolute(self.db.db_path + "-wal"),
+            absolute(self.db.db_path + "-shm"),
+            absolute(self.db.db_path + "-journal"),
         }
 
         print(f"Scanning: {root}")
@@ -722,7 +726,8 @@ class Scanner:
     def _scan_recursive(self, dirpath: str, progress: bool) -> Tuple[int, int]:
         dir_total_size = 0
         latest_mtime = 0
-        depth = path_depth(dirpath)
+        depth = dirpath.count(os.sep)
+        parent_dir = os.path.dirname(dirpath)
 
         if self._should_skip_dir(dirpath):
             return 0, 0
@@ -730,70 +735,65 @@ class Scanner:
         try:
             dir_stat = os.stat(dirpath, follow_symlinks=False)
             latest_mtime = int(dir_stat.st_mtime)
-            entries = list(os.scandir(dirpath))
         except (PermissionError, OSError) as exc:
             self._record_error(dirpath, str(exc))
             return 0, 0
 
-        for entry in entries:
-            try:
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                file_path = canonical(entry.path)
-                if self._should_skip_file(file_path):
-                    continue
+        try:
+            with os.scandir(dirpath) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            file_path = entry.path
+                            if self._should_skip_file(file_path):
+                                continue
 
-                stat = entry.stat(follow_symlinks=False)
-                size = int(stat.st_size)
-                mtime = int(stat.st_mtime)
-                name = entry.name
-                ext = os.path.splitext(name)[1].lstrip(".").lower() if "." in name else None
+                            stat = entry.stat(follow_symlinks=False)
+                            size = int(stat.st_size)
+                            mtime = int(stat.st_mtime)
+                            name = entry.name
+                            ext = os.path.splitext(name)[1].lstrip(".").lower() if "." in name else None
 
-                self.files_batch.append(
-                    (
-                        file_path,
-                        name,
-                        ext,
-                        size,
-                        mtime,
-                        1 if name.startswith(".") else 0,
-                        1 if size == 0 else 0,
-                        canonical(dirpath),
-                        depth,
-                    )
-                )
+                            self.files_batch.append(
+                                (
+                                    file_path,
+                                    name,
+                                    ext,
+                                    size,
+                                    mtime,
+                                    1 if name.startswith(".") else 0,
+                                    1 if size == 0 else 0,
+                                    dirpath,
+                                    depth,
+                                )
+                            )
 
-                dir_total_size += size
-                latest_mtime = max(latest_mtime, mtime)
-                self.total_size += size
-                self.file_count += 1
+                            dir_total_size += size
+                            latest_mtime = max(latest_mtime, mtime)
+                            self.total_size += size
+                            self.file_count += 1
 
-                if progress and self.file_count % 10000 == 0:
-                    elapsed = max((datetime.now() - self.started_at).total_seconds(), 0.001)
-                    print(
-                        f"  {self.file_count:,} files, {self.dir_count:,} dirs "
-                        f"({self.file_count / elapsed:,.0f} files/sec)",
-                        end="\r",
-                    )
+                            if progress and self.file_count % 10000 == 0:
+                                elapsed = max((datetime.now() - self.started_at).total_seconds(), 0.001)
+                                print(
+                                    f"  {self.file_count:,} files, {self.dir_count:,} dirs "
+                                    f"({self.file_count / elapsed:,.0f} files/sec)",
+                                    end="\r",
+                                )
 
-                if len(self.files_batch) >= self.batch_size:
-                    self._flush_files()
-            except (PermissionError, OSError) as exc:
-                self._record_error(entry.path, str(exc))
-
-        for entry in entries:
-            try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                subdir_size, subdir_mtime = self._scan_recursive(entry.path, progress)
-                dir_total_size += subdir_size
-                latest_mtime = max(latest_mtime, subdir_mtime)
-            except (PermissionError, OSError) as exc:
-                self._record_error(entry.path, str(exc))
+                            if len(self.files_batch) >= self.batch_size:
+                                self._flush_files()
+                        elif entry.is_dir(follow_symlinks=False):
+                            subdir_size, subdir_mtime = self._scan_recursive(entry.path, progress)
+                            dir_total_size += subdir_size
+                            latest_mtime = max(latest_mtime, subdir_mtime)
+                    except (PermissionError, OSError) as exc:
+                        self._record_error(entry.path, str(exc))
+        except (PermissionError, OSError) as exc:
+            self._record_error(dirpath, str(exc))
 
         name = os.path.basename(dirpath) or dirpath
-        parent = canonical(os.path.dirname(dirpath))
-        self.dirs_batch.append((canonical(dirpath), name, parent, depth, dir_total_size, latest_mtime))
+        self.dirs_batch.append((dirpath, name, parent_dir, depth, dir_total_size, latest_mtime))
         self.dir_count += 1
 
         if len(self.dirs_batch) >= self.batch_size:
@@ -802,17 +802,17 @@ class Scanner:
         return dir_total_size, latest_mtime
 
     def _should_skip_dir(self, path: str) -> bool:
-        real = canonical(path)
-        if os.path.basename(real) == QUARANTINE_DIR_NAME:
+        path = absolute(path)
+        if os.path.basename(path) == QUARANTINE_DIR_NAME:
             return True
-        return real in self.internal_db_paths
+        return path in self.internal_db_paths
 
     def _should_skip_file(self, path: str) -> bool:
-        return canonical(path) in self.internal_db_paths
+        return absolute(path) in self.internal_db_paths
 
     def _record_error(self, path: str, error: str) -> None:
         self.error_count += 1
-        self.errors_batch.append((canonical(path), error))
+        self.errors_batch.append((absolute(path), error))
         if len(self.errors_batch) >= self.batch_size:
             self._flush_errors()
 
