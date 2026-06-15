@@ -112,6 +112,8 @@ STALE_REASONS = {
     "expected file",
 }
 
+PROGRESS_WIDTH = 28
+
 
 def validate_candidate_state(cand: "Candidate", root: str) -> None:
     path = absolute(cand.path)
@@ -133,6 +135,39 @@ def validate_candidate_state(cand: "Candidate", root: str) -> None:
         current_size = os.stat(path, follow_symlinks=False).st_size
         if current_size != cand.size:
             raise RuntimeError("file size changed since scan; rescan first")
+
+
+class Progress:
+    def __init__(self, total_count: int, total_size: int, label: str, enabled: bool = True):
+        self.total_count = max(total_count, 1)
+        self.total_size = max(total_size, 0)
+        self.label = label
+        self.enabled = enabled and sys.stderr.isatty()
+        self.last_render = 0.0
+
+    def update(self, done: int, changed: int, failed: int, processed_size: int, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        current = datetime.now().timestamp()
+        if not force and current - self.last_render < 0.2 and done < self.total_count:
+            return
+        self.last_render = current
+        ratio = min(max(done / self.total_count, 0.0), 1.0)
+        filled = int(PROGRESS_WIDTH * ratio)
+        bar = "#" * filled + "-" * (PROGRESS_WIDTH - filled)
+        size_text = format_size(processed_size)
+        total_text = format_size(self.total_size)
+        text = (
+            f"\r{self.label}: [{bar}] {done:,}/{self.total_count:,} "
+            f"{size_text}/{total_text} changed={changed:,} failed={failed:,}"
+        )
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 @dataclass(frozen=True)
@@ -1162,7 +1197,11 @@ class Cleaner:
         yes: bool = False,
         quarantine: Optional[str] = None,
         manifest: Optional[str] = None,
+        progress: bool = True,
     ) -> None:
+        if not os.path.isdir(self.root):
+            raise RuntimeError(f"scan root is not currently available: {self.root}")
+
         candidates = self.planner.candidates(tier=tier, rule_name=rule_name, min_size=min_size)
         if not candidates:
             print("No cleanup candidates found.")
@@ -1195,13 +1234,14 @@ class Cleaner:
                 return
 
         manifest_path = manifest or self._default_manifest_path(action)
-        rows = self._apply(candidates, action, quarantine_root, manifest_path)
+        rows = self._apply(candidates, action, quarantine_root, manifest_path, progress=progress)
         deleted_paths = [row["path"] for row in rows if row["status"] in ("deleted", "quarantined")]
         self._remove_from_inventory(deleted_paths)
 
         success = sum(1 for row in rows if row["status"] in ("deleted", "quarantined"))
         failed = len(rows) - success
         print(f"\nFinished: {success:,} changed, {failed:,} failed/skipped")
+        self._print_failures(rows)
         print(f"Manifest: {manifest_path}")
         if quarantine_root:
             print(f"Quarantine: {quarantine_root}")
@@ -1212,13 +1252,19 @@ class Cleaner:
         action: str,
         quarantine_root: Optional[str],
         manifest_path: str,
+        progress: bool = True,
     ) -> List[Dict[str, object]]:
         os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
         if quarantine_root:
             os.makedirs(quarantine_root, exist_ok=True)
 
         rows: List[Dict[str, object]] = []
-        for cand in candidates:
+        changed = 0
+        failed = 0
+        processed_size = 0
+        progress_bar = Progress(len(candidates), sum(c.size for c in candidates), action, enabled=progress)
+        progress_bar.update(0, changed, failed, processed_size, force=True)
+        for index, cand in enumerate(candidates, 1):
             row = cand.as_dict(self.root)
             row.update({"action": action, "status": "pending", "error": "", "destination": ""})
             try:
@@ -1236,7 +1282,14 @@ class Cleaner:
             except Exception as exc:
                 row["status"] = "failed"
                 row["error"] = str(exc)
+            if row["status"] in ("deleted", "quarantined"):
+                changed += 1
+                processed_size += cand.size
+            elif row["status"] == "failed":
+                failed += 1
             rows.append(row)
+            progress_bar.update(index, changed, failed, processed_size)
+        progress_bar.finish()
 
         fieldnames = [
             "action",
@@ -1260,6 +1313,34 @@ class Cleaner:
             for row in rows:
                 writer.writerow({key: row.get(key, "") for key in fieldnames})
         return rows
+
+    def _print_failures(self, rows: Sequence[Dict[str, object]], limit: int = 8) -> None:
+        failures = [row for row in rows if row.get("status") == "failed"]
+        if not failures:
+            return
+
+        counts: Dict[str, int] = {}
+        examples: Dict[str, List[Dict[str, object]]] = {}
+        for row in failures:
+            error = str(row.get("error") or "unknown error")
+            counts[error] = counts.get(error, 0) + 1
+            examples.setdefault(error, [])
+            if len(examples[error]) < 2:
+                examples[error].append(row)
+
+        print("\nFailure summary:")
+        printed = 0
+        for error, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            print(f"  {count:,} failed: {error}")
+            for row in examples[error]:
+                rel = row.get("relative_path") or row.get("path") or ""
+                print(f"    - {rel}")
+            printed += 1
+            if printed >= limit:
+                remaining = len(counts) - printed
+                if remaining > 0:
+                    print(f"  ... and {remaining:,} more error groups")
+                break
 
     def _validate_candidate(self, cand: Candidate) -> None:
         validate_candidate_state(cand, self.root)
@@ -1416,6 +1497,7 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument("--delete", action="store_true", help="Permanently delete safe candidates")
     clean.add_argument("--yes", action="store_true", help="Skip interactive confirmation")
     clean.add_argument("--manifest", help="CSV manifest path")
+    clean.add_argument("--no-progress", action="store_true", help="Disable cleanup progress output")
 
     delete = sub.add_parser("delete", help="Backward-compatible alias for 'clean --delete'")
     delete.add_argument("rule", nargs="?")
@@ -1424,6 +1506,7 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("--no-dry-run", action="store_true", help="Actually delete; otherwise dry-run")
     delete.add_argument("--yes", action="store_true")
     delete.add_argument("--manifest")
+    delete.add_argument("--no-progress", action="store_true", help="Disable cleanup progress output")
 
     sub.add_parser("stats", help="Show inventory statistics")
     sub.add_parser("list-rules", help="List cleanup rules")
@@ -1492,6 +1575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 yes=args.yes,
                 quarantine=quarantine,
                 manifest=args.manifest,
+                progress=not args.no_progress,
             )
         elif args.command == "delete":
             action = "delete" if args.no_dry_run else "dry-run"
@@ -1503,6 +1587,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 yes=args.yes,
                 quarantine=None,
                 manifest=args.manifest,
+                progress=not args.no_progress,
             )
         elif args.command == "stats":
             show_stats(db)

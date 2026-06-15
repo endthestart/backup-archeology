@@ -2,7 +2,10 @@ import csv
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import ba
 
@@ -94,6 +97,33 @@ class BackupArcheologyTests(unittest.TestCase):
         with manifest.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual("quarantined", rows[0]["status"])
+
+    def test_quarantine_failure_prints_error_summary(self) -> None:
+        target = self.root / "project" / "node_modules" / "pkg" / "index.js"
+        touch(target)
+        self.scan()
+
+        quarantine = Path(self.tmp.name) / "quarantine"
+        manifest = Path(self.tmp.name) / "manifest.csv"
+        output = StringIO()
+
+        with patch("ba.shutil.move", side_effect=OSError("simulated move failure")):
+            with redirect_stdout(output):
+                ba.Cleaner(self.db).clean(
+                    action="quarantine",
+                    tier=ba.SAFE,
+                    rule_name="node_modules",
+                    yes=True,
+                    quarantine=str(quarantine),
+                    manifest=str(manifest),
+                    progress=False,
+                )
+
+        text = output.getvalue()
+        self.assertIn("Finished: 0 changed, 1 failed/skipped", text)
+        self.assertIn("Failure summary:", text)
+        self.assertIn("simulated move failure", text)
+        self.assertIn("project/node_modules", text)
 
     def test_delete_multiple_directories_updates_inventory(self) -> None:
         touch(self.root / "a" / "__pycache__" / "a.pyc")
