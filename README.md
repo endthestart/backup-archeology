@@ -43,7 +43,13 @@ python -m pip install -e .
 ba --version
 ```
 
-No third-party runtime dependencies are required.
+No third-party runtime dependencies are required. On a machine without `pip`,
+you can run the single-file CLI directly:
+
+```bash
+python3 ba.py --version
+python3 ba.py scan /path/to/backups
+```
 
 ## Quick Start
 
@@ -77,6 +83,7 @@ ba clean --tier safe --delete --yes
 | `ba scan <path>` | Build an inventory for one backup root |
 | `ba analyze` | Summarize candidate counts and sizes |
 | `ba review [rule]` | Print candidate paths |
+| `ba validate [rule]` | Check candidates against the current filesystem |
 | `ba plan [rule]` | Export candidates as CSV or JSON |
 | `ba clean [rule]` | Dry-run, quarantine, or delete safe candidates |
 | `ba stats` | Show inventory statistics |
@@ -110,6 +117,12 @@ meant to be exported and inspected.
 - The scanner skips its own SQLite database and quarantine directory.
 - Permanent deletion is limited to the `safe` tier.
 - Quarantine mode preserves relative paths for recovery.
+- `analyze`, `review`, and `plan` use the inventory without touching the live
+  filesystem, so they stay fast on large or network-mounted archives.
+- `validate` checks candidate paths only when you ask for it, and can prune
+  missing/type-changed candidates from the inventory with `--prune-stale`.
+- `clean` always validates each candidate immediately before quarantine or
+  deletion, then removes successful changes from the inventory.
 - Every real cleanup writes a CSV manifest with action, status, path, size, rule,
   destination, and error columns.
 
@@ -159,6 +172,7 @@ meant to be exported and inspected.
 ```bash
 ba scan /Volumes/NAS/Backups
 ba analyze
+ba validate --tier safe
 ba plan --tier all --format csv --output nas-cleanup-plan.csv
 ba review --tier safe --limit 200
 ba clean --tier safe --quarantine /Volumes/NAS/Backups/.backup-archeology-quarantine

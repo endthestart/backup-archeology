@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 VERSION = "1.0.0"
@@ -101,13 +101,38 @@ def parse_size(value: Optional[str]) -> int:
 
 
 def is_within(path: str, root: str) -> bool:
-    path = canonical(path)
-    root = canonical(root)
+    path = absolute(path)
+    root = absolute(root)
     return path == root or path.startswith(root + os.sep)
 
 
-def path_depth(path: str) -> int:
-    return canonical(path).count(os.sep)
+STALE_REASONS = {
+    "path no longer exists",
+    "expected directory",
+    "expected file",
+}
+
+
+def validate_candidate_state(cand: "Candidate", root: str) -> None:
+    path = absolute(cand.path)
+    root = absolute(root)
+    if not is_within(path, root):
+        raise RuntimeError("refusing path outside scanned root")
+    if path == root:
+        raise RuntimeError("refusing to remove scan root")
+    if any(part in PROTECTED_NAMES for part in Path(path).parts):
+        raise RuntimeError("refusing protected path")
+    if not os.path.lexists(path):
+        raise RuntimeError("path no longer exists")
+    if cand.kind == KIND_DIR:
+        if not os.path.isdir(path) or os.path.islink(path):
+            raise RuntimeError("expected directory")
+    else:
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise RuntimeError("expected file")
+        current_size = os.stat(path, follow_symlinks=False).st_size
+        if current_size != cand.size:
+            raise RuntimeError("file size changed since scan; rescan first")
 
 
 @dataclass(frozen=True)
@@ -876,7 +901,7 @@ class Planner:
         for rule in rules:
             for row in self.db.conn.execute(rule.sql):
                 cand = Candidate(
-                    path=canonical(row[0]),
+                    path=absolute(row[0]),
                     size=int(row[1] or 0),
                     mtime=int(row[2] or 0),
                     kind=rule.kind,
@@ -895,7 +920,6 @@ class Planner:
                     by_key[key] = cand
 
         candidates = list(by_key.values())
-        candidates.sort(key=lambda item: (0 if item.kind == KIND_DIR else 1, path_depth(item.path), item.path))
 
         if not include_nested:
             candidates = self._collapse_nested(candidates)
@@ -1027,7 +1051,7 @@ class Planner:
     def _candidate_allowed(self, cand: Candidate) -> bool:
         if not is_within(cand.path, self.root):
             return False
-        if canonical(cand.path) == canonical(self.root):
+        if absolute(cand.path) == absolute(self.root):
             return False
         parts = set(Path(cand.path).parts)
         if parts.intersection(PROTECTED_NAMES):
@@ -1037,18 +1061,90 @@ class Planner:
         return True
 
     def _collapse_nested(self, candidates: Sequence[Candidate]) -> List[Candidate]:
-        kept_dirs: List[str] = []
+        active_dirs: List[str] = []
         result: List[Candidate] = []
-        for cand in sorted(candidates, key=lambda item: (0 if item.kind == KIND_DIR else 1, path_depth(item.path))):
-            if any(is_within(cand.path, parent) and canonical(cand.path) != canonical(parent) for parent in kept_dirs):
+
+        def nested(path: str, parent: str) -> bool:
+            return path == parent or path.startswith(parent + os.sep)
+
+        entries = sorted(
+            ((absolute(cand.path), cand) for cand in candidates),
+            key=lambda item: (item[0], 0 if item[1].kind == KIND_DIR else 1),
+        )
+
+        for path, cand in entries:
+            while active_dirs and not nested(path, active_dirs[-1]):
+                active_dirs.pop()
+            if active_dirs and path != active_dirs[-1]:
                 continue
             result.append(cand)
             if cand.kind == KIND_DIR:
-                kept_dirs.append(cand.path)
+                active_dirs.append(path)
         return result
 
     def _tier_rank(self, tier: str) -> int:
         return {SAFE: 1, REVIEW: 2}.get(tier, 0)
+
+
+class InventoryValidator:
+    def __init__(self, db: Database):
+        self.db = db
+        self.planner = Planner(db)
+        self.root = self.planner.root
+
+    def validate(
+        self,
+        tier: str = "all",
+        rule_name: Optional[str] = None,
+        min_size: int = 0,
+        prune_stale: bool = False,
+        limit: int = 20,
+    ) -> None:
+        if not os.path.isdir(self.root):
+            raise RuntimeError(f"scan root is not currently available: {self.root}")
+
+        candidates = self.planner.candidates(tier=tier, rule_name=rule_name, min_size=min_size)
+        if not candidates:
+            print("No cleanup candidates found.")
+            return
+
+        ok = 0
+        failures: Dict[str, int] = {}
+        examples: List[Tuple[Candidate, str]] = []
+        stale_paths: List[str] = []
+
+        for cand in candidates:
+            try:
+                validate_candidate_state(cand, self.root)
+                ok += 1
+            except RuntimeError as exc:
+                reason = str(exc)
+                failures[reason] = failures.get(reason, 0) + 1
+                if len(examples) < limit:
+                    examples.append((cand, reason))
+                if reason in STALE_REASONS:
+                    stale_paths.append(cand.path)
+
+        print(f"\nValidation for: {self.root}")
+        print(f"  Candidates checked: {len(candidates):,}")
+        print(f"  Valid: {ok:,}")
+        failed = len(candidates) - ok
+        print(f"  Failed: {failed:,}")
+        for reason, count in sorted(failures.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    {reason}: {count:,}")
+
+        if examples:
+            print("\nExamples")
+            print("-" * 88)
+            for cand, reason in examples:
+                rel = os.path.relpath(cand.path, self.root)
+                print(f"{reason:42s} {cand.kind:4s} {cand.rule:24s} {rel}")
+
+        if prune_stale:
+            Cleaner(self.db)._remove_from_inventory(stale_paths)
+            print(f"\nPruned stale inventory rows: {len(stale_paths):,}")
+        elif stale_paths:
+            print("\nUse '--prune-stale' to remove missing/type-changed candidates from the inventory.")
 
 
 class Cleaner:
@@ -1166,24 +1262,7 @@ class Cleaner:
         return rows
 
     def _validate_candidate(self, cand: Candidate) -> None:
-        path = canonical(cand.path)
-        if not is_within(path, self.root):
-            raise RuntimeError("refusing path outside scanned root")
-        if path == canonical(self.root):
-            raise RuntimeError("refusing to remove scan root")
-        if any(part in PROTECTED_NAMES for part in Path(path).parts):
-            raise RuntimeError("refusing protected path")
-        if not os.path.lexists(path):
-            raise RuntimeError("path no longer exists")
-        if cand.kind == KIND_DIR:
-            if not os.path.isdir(path) or os.path.islink(path):
-                raise RuntimeError("expected directory")
-        else:
-            if not os.path.isfile(path) or os.path.islink(path):
-                raise RuntimeError("expected file")
-            current_size = os.stat(path, follow_symlinks=False).st_size
-            if current_size != cand.size:
-                raise RuntimeError("file size changed since scan; rescan first")
+        validate_candidate_state(cand, self.root)
 
     def _delete_path(self, cand: Candidate) -> None:
         if cand.kind == KIND_DIR:
@@ -1233,7 +1312,7 @@ class Cleaner:
             return
         cursor = self.db.conn.cursor()
         for path in paths:
-            real = canonical(path)
+            real = absolute(path)
             cursor.execute("DELETE FROM files WHERE path = ?", (real,))
             cursor.execute("DELETE FROM directories WHERE path = ?", (real,))
             cursor.execute("DELETE FROM files WHERE path LIKE ?", (real + os.sep + "%",))
@@ -1311,6 +1390,17 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--limit", type=int, default=50)
     review.add_argument("--min-size", type=parse_size, default=0)
 
+    validate = sub.add_parser("validate", help="Validate cleanup candidates against the current filesystem")
+    validate.add_argument("rule", nargs="?")
+    validate.add_argument("--tier", choices=("all", SAFE, REVIEW), default="all")
+    validate.add_argument("--limit", type=int, default=20, help="Maximum failed examples to print")
+    validate.add_argument("--min-size", type=parse_size, default=0)
+    validate.add_argument(
+        "--prune-stale",
+        action="store_true",
+        help="Remove missing/type-changed candidate rows from the inventory",
+    )
+
     plan = sub.add_parser("plan", help="Export cleanup candidates as CSV or JSON")
     plan.add_argument("rule", nargs="?")
     plan.add_argument("--tier", choices=("all", SAFE, REVIEW), default="all")
@@ -1366,6 +1456,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tier=args.tier,
                 rule_name=args.rule,
                 min_size=args.min_size,
+                limit=args.limit,
+            )
+        elif args.command == "validate":
+            InventoryValidator(db).validate(
+                tier=args.tier,
+                rule_name=args.rule,
+                min_size=args.min_size,
+                prune_stale=args.prune_stale,
                 limit=args.limit,
             )
         elif args.command == "plan":

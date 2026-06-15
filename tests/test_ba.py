@@ -129,6 +129,22 @@ class BackupArcheologyTests(unittest.TestCase):
                 manifest=str(Path(self.tmp.name) / "delete.csv"),
             )
 
+    def test_validate_prune_stale_removes_missing_candidate_from_inventory(self) -> None:
+        target = self.root / "project" / "__pycache__" / "module.pyc"
+        touch(target)
+        self.scan()
+        target.unlink()
+
+        ba.InventoryValidator(self.db).validate(
+            tier=ba.SAFE,
+            rule_name="python_bytecode",
+            prune_stale=True,
+            limit=0,
+        )
+
+        rows = self.db.conn.execute("SELECT path FROM files WHERE name = 'module.pyc'").fetchall()
+        self.assertEqual([], rows)
+
     def test_kopia_exclude_rules_cover_cross_platform_junk(self) -> None:
         safe_paths = [
             self.root / "$RECYCLE.BIN" / "item",
